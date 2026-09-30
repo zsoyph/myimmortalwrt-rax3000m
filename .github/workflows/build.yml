@@ -1,0 +1,151 @@
+name: Build RAX3000M NAND (ImmortalWrt 24.10 + padavanonly MTK closed-source wifi)
+
+on:
+  workflow_dispatch:
+    inputs:
+      upload_release:
+        description: 'Upload firmware to GitHub Release'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+  push:
+    paths:
+      - "config/**"
+      - "patches/**"
+      - "packages/**"
+      - ".github/workflows/**"
+
+env:
+  REPO_URL: https://github.com/padavanonly/immortalwrt-mt798x-6.6
+  REPO_BRANCH: openwrt-24.10-6.6
+  CONFIG_FILE: config/cmcc_rax3000m.seed.config
+  PATCH_DIR: patches
+  CUSTOM_PACKAGES_DIR: packages
+  DEVICE_NAME: cmcc_rax3000m
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force > /dev/null 2>&1 || true
+          df -hT
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get -y install build-essential clang flex bison g++ gawk gcc-multilib \
+            g++-multilib gettext git libncurses-dev libssl-dev python3-distutils \
+            python3-ply python3-pyelftools rsync unzip zlib1g-dev file wget curl \
+            subversion patch upx-ucl autoconf automake libtool antlr3 gperf swig ccache zstd xxd
+
+      - name: Clone ImmortalWrt-mt798x source
+        run: git clone --depth 1 -b $REPO_BRANCH $REPO_URL openwrt
+
+      - name: Apply legacy U-Boot image patch
+        working-directory: openwrt
+        run: |
+          # 将 cmcc_rax3000m 镜像输出从 sysupgrade.itb (FIT) 改为 tar sysupgrade.bin，
+          # 兼容设备内置的旧版 bl-mt798x U-Boot（分区表与官方 ubootmod 不同）
+          git apply --check ../$PATCH_DIR/001-cmcc_rax3000m-legacy-uboot-image.patch
+          git apply ../$PATCH_DIR/001-cmcc_rax3000m-legacy-uboot-image.patch
+          grep -A4 "legacy bl-mt798x" target/linux/mediatek/image/filogic.mk
+
+      - name: Copy custom packages
+        working-directory: openwrt
+        run: |
+          # 雷神加速器（内核模块 + LuCI）、iStore 全家（store/taskd/lib-taskd/lib-xterm）、wolplus
+          mkdir -p package/custom
+          cp -r ../$CUSTOM_PACKAGES_DIR/* package/custom/
+          ls package/custom/
+          # 剥离 feeds 里的 perl 包：
+          # 该配置下没有任何包依赖 perl，但其交叉构建（miniperl 自检）必然失败并阻断 make
+          rm -rf package/feeds/packages/perl
+          echo "perl stripped from feeds"
+
+      - name: Setup feeds
+        working-directory: openwrt
+        run: |
+          # feeds.conf 存在时会整体遮蔽 feeds.conf.default，
+          # 必须先复制默认 feed 列表再追加，否则 luci/packages 等基础 feed 不会被拉取
+          cat feeds.conf.default > feeds.conf
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Load config
+        working-directory: openwrt
+        run: |
+          cp "$GITHUB_WORKSPACE/$CONFIG_FILE" .config
+          make defconfig
+          # 关键包验证：任何一个被 kconfig 静默丢弃都说明依赖链出了问题
+          for pkg in luci-app-openclash luci-app-store luci-app-upnp luci-app-diskman \
+                     luci-app-vlmcsd luci-app-wolplus luci-app-leigod-acc luci-theme-argon \
+                     luci-app-cifs-mount luci-app-ddns luci-app-watchcat luci-app-mtwifi-cfg \
+                     cifsmount dnsmasq-full; do
+            grep -q "^CONFIG_PACKAGE_${pkg}=y" .config || { echo "MISSING: $pkg"; exit 1; }
+          done
+          echo "All key packages selected."
+
+      - name: Download packages
+        working-directory: openwrt
+        run: |
+          make download -j$(nproc)
+          # 删除异常小文件（下载失败的 404/重定向残留）后补一遍
+          find dl -size -1024c -type f -delete || true
+          make download -j$(nproc)
+
+      - name: Build firmware
+        id: build
+        working-directory: openwrt
+        run: |
+          export FORCE_UNSAFE_CONFIGURE=1
+          make -j$(nproc) 2>&1 | tee build.log | grep -E "(Error|error:)" || true
+          make -j$(nproc) || make -j1 V=s || (echo BUILD_FAILED && exit 1)
+          df -hT
+
+      - name: Organize firmware
+        if: always() && steps.build.outcome == 'success'
+        run: |
+          cd openwrt/bin/targets/mediatek/filogic
+          rm -rf packages
+          ls -lh
+          echo "ARTIFACT_DIR=$(pwd)" >> $GITHUB_ENV
+
+      - name: Upload firmware artifact
+        if: always() && steps.build.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: immortalwrt-rax3000m-nand-${{ github.run_number }}
+          path: |
+            openwrt/bin/targets/mediatek/filogic/*sysupgrade*
+            openwrt/bin/targets/mediatek/filogic/*preloader*
+            openwrt/bin/targets/mediatek/filogic/*fip
+            openwrt/bin/targets/mediatek/filogic/*.manifest
+          retention-days: 30
+
+      - name: Upload to release
+        if: github.event.inputs.upload_release == 'true' && steps.build.outcome == 'success'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: immortalwrt-${{ github.run_number }}
+          name: ImmortalWrt RAX3000M NAND ${{ github.run_number }}
+          body: |
+            ImmortalWrt 24.10 (padavanonly/immortalwrt-mt798x-6.6) + MTK closed-source mtwifi
+            Device: CMCC RAX3000M NAND (legacy bl-mt798x U-Boot compatible tar.bin)
+            Commit: ${{ github.sha }}
+          files: |
+            openwrt/bin/targets/mediatek/filogic/*sysupgrade*
+            openwrt/bin/targets/mediatek/filogic/*preloader*
+            openwrt/bin/targets/mediatek/filogic/*fip
+            openwrt/bin/targets/mediatek/filogic/*.manifest
